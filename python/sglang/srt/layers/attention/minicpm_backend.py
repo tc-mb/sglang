@@ -274,6 +274,8 @@ class MiniCPMSparseBackend(AttentionBackend):
 
         if model_runner.server_args.fuse_topk:
             print("jit start...")
+            bucketed_actual_max_seqlen_q = _bucket_size(model_runner.server_args.chunked_prefill_size)
+            bucketed_actual_max_seqlen_k = _bucket_size(self.max_context_len // self.kernel_stride)
             for bs in range(1, model_runner.server_args.max_running_requests + 1):
                 decode_kernel = fused_attn_pooling_online_topk_decode(
                     batch_size=bs,
@@ -300,8 +302,8 @@ class MiniCPMSparseBackend(AttentionBackend):
                     topk=kernel_topk,
                     max_seqlen_q_grid=model_runner.server_args.chunked_prefill_size,  # Bucketed for grid
                     pooled_k_len=bucketed_pooled_k_len,
-                    # actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
-                    # actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
+                    actual_max_seqlen_q=bucketed_actual_max_seqlen_q,  # Bucketed for causal mask
+                    actual_max_seqlen_k=bucketed_actual_max_seqlen_k,  # Bucketed for causal mask
                     m_block_dim=16,
                     block_stride=pooling_block_stride,
                     pad_len=pooling_pad_len,
@@ -443,7 +445,6 @@ class MiniCPMSparseBackend(AttentionBackend):
             
             seqlen_q_sparse_tensor = torch.tensor(seqlens_q_sparse_list, dtype=torch.int32, device=metadata.cu_seqlens_q.device)
             cu_seqlen_q_sparse_tensor = F.pad(torch.cumsum(seqlen_q_sparse_tensor, dim=0, dtype=torch.int32), (1, 0))
-            # metadata.cu_seqlens_q = torch.cat(cu_seqlens_q_list, dim=0)
             metadata.cu_seqlens_q_adjusted = cu_seqlen_q_sparse_tensor * self.heads_per_group
             metadata.max_seqlen_q_adjusted = seqlen_q_sparse_tensor.max().item() * self.heads_per_group
         else:
@@ -600,7 +601,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     full_compressed_k2=compressed_k2, # output
                     max_context_length=self.max_context_len,
                 )
-                
+
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_in_batch_k = metadata.max_seq_len_k
                 cu_seqlens_q = metadata.cu_seqlens_q
@@ -864,7 +865,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 compressed_cu_seqlens,
                 compressed_cu_seqlens2,
                 max_seqlen_in_batch_q,
-                self.forward_metadata.max_seq_len_k1,
+                self.forward_metadata.k1.max_seq_len,
                 None,
                 init_blocks=self.init_blocks,
                 local_blocks=self.local_blocks,

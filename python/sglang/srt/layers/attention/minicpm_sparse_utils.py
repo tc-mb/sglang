@@ -22,9 +22,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+import tilelang
+import tilelang.math
 import triton
 from infllm_v2 import infllmv2_attn_stage1, max_pooling_1d_varlen
 
+from sglang.srt.layers.attention.minicpm_fuse_kernel import _bucket_size
 from sglang.srt.layers.attention.minicpm_sparse_kernels import (
     compress_k_complete_kernel_new,
     compress_k_complete_kernel_new_padded,
@@ -562,7 +565,7 @@ def compressed_attention_tilelang(
     cache_lens=None,
     fused_kernel=None,
     max_cache_len=-1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     使用 tilelang online topk kernel 计算 compressed attention topk indices
     """
