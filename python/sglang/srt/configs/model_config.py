@@ -1289,6 +1289,7 @@ multimodal_model_archs = [
     "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
+    "MiniCPMV4_6ForConditionalGeneration",
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",

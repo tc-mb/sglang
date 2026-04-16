@@ -7,7 +7,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
 )
 from sglang.srt.models.minicpmo import MiniCPMO
-from sglang.srt.models.minicpmv import MiniCPMV
+from sglang.srt.models.minicpmv import (
+    MiniCPMV,
+    MiniCPMV4_6ForConditionalGeneration,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
@@ -17,21 +20,48 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 # Compatible with both 'O' and 'V'
 class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
-    models = [MiniCPMV, MiniCPMO]
+    models = [MiniCPMV, MiniCPMO, MiniCPMV4_6ForConditionalGeneration]
     support_dynamic_frame_expansion = True
     gpu_image_decode = False  # MiniCPM HF processor does not support tensor inputs
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-        # Collect special token ids
+        # Collect special token ids. MiniCPM-V 2.6/4.x exposes them as
+        # tokenizer attributes; MiniCPM-V 4.6 ships them only in the vocab,
+        # so we fall back to a vocab lookup by literal token string.
         tokenizer = self._processor.tokenizer
-        self.slice_start_id = getattr(tokenizer, "slice_start_id", None)
-        self.slice_end_id = getattr(tokenizer, "slice_end_id", None)
-        self.audio_start_id = getattr(tokenizer, "audio_start_id", None)
-        self.audio_end_id = getattr(tokenizer, "audio_end_id", None)
-        self.im_start_id = getattr(tokenizer, "im_start_id", None)
-        self.im_end_id = getattr(tokenizer, "im_end_id", None)
-        self.im_token_id = getattr(tokenizer, "unk_id", None)
+        vocab = tokenizer.get_vocab()
+
+        def _lookup_id(attr: str, *fallback_tokens: str):
+            val = getattr(tokenizer, attr, None)
+            if val is not None:
+                return val
+            for tok in fallback_tokens:
+                if tok in vocab:
+                    return vocab[tok]
+            return None
+
+        self.slice_start_id = _lookup_id(
+            "slice_start_id", "<slice>",
+        )
+        self.slice_end_id = _lookup_id(
+            "slice_end_id", "</slice>",
+        )
+        self.audio_start_id = _lookup_id(
+            "audio_start_id", "<|audio_start|>",
+        )
+        self.audio_end_id = _lookup_id(
+            "audio_end_id", "<|audio_end|>",
+        )
+        self.im_start_id = _lookup_id(
+            "im_start_id", "<image>",
+        )
+        self.im_end_id = _lookup_id(
+            "im_end_id", "</image>",
+        )
+        self.im_token_id = _lookup_id(
+            "unk_id", "<unk>",
+        )
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="(<image>./</image>)",
             audio_token="(<audio>./</audio>)",

@@ -1331,399 +1331,7 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         return self
 
 
-# ===================== V5.0 Specific Modules =====================
-
-
-class ViTMergerAttention5_0(nn.Module):
-    """Self-attention for the ViT merger 2x2 window."""
-
-    def __init__(self, hidden_size: int, num_heads: int):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.scale = self.head_dim**-0.5
-
-        self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
-        self.out_proj = nn.Linear(hidden_size, hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        N, W, D = x.shape
-
-        q = self.q_proj(x).view(N, W, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(N, W, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(N, W, self.num_heads, self.head_dim)
-
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scale
-        )
-        attn_output = attn_output.transpose(1, 2).reshape(N, W, D)
-        return self.out_proj(attn_output)
-
-
-class ViTMergerMLP5_0(nn.Module):
-    """SiglipMLP-compatible MLP for the ViT merger."""
-
-    def __init__(
-        self, hidden_size: int, intermediate_size: int, hidden_act: str
-    ):
-        super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size)
-        if hidden_act == "gelu_pytorch_tanh":
-            self.activation_fn = nn.GELU(approximate="tanh")
-        else:
-            self.activation_fn = nn.GELU()
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        return hidden_states
-
-
-class ViTWindowAttentionMerger5_0(nn.Module):
-    """ViT merger with 2x2 window attention + ViTmlp downsampling for V5.0.
-
-    Inserted after a specific ViT encoder layer to reduce spatial dimensions
-    by 2x in each axis (total 4x token reduction).
-    """
-
-    def __init__(self, vision_config: PretrainedConfig):
-        super().__init__()
-        hidden_size = vision_config.hidden_size
-        intermediate_size = vision_config.intermediate_size
-        num_heads = vision_config.num_attention_heads
-        hidden_act = getattr(
-            vision_config, "hidden_act", "gelu_pytorch_tanh"
-        )
-        layer_norm_eps = getattr(vision_config, "layer_norm_eps", 1e-6)
-
-        self.window_kernel_size = (2, 2)
-
-        self.self_attn = ViTMergerAttention5_0(hidden_size, num_heads)
-        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-        self.mlp = ViTMergerMLP5_0(hidden_size, intermediate_size, hidden_act)
-        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
-
-        merged_dim = hidden_size * 4
-        merged_intermediate = intermediate_size * 4
-        self.pre_norm = nn.LayerNorm(merged_dim, eps=1e-6)
-        self.linear_1 = nn.Linear(merged_dim, merged_intermediate, bias=True)
-        self.act = nn.GELU(approximate="tanh")
-        self.linear_2 = nn.Linear(merged_intermediate, hidden_size, bias=True)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        tgt_sizes: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        m1, m2 = self.window_kernel_size
-        B = tgt_sizes.shape[0]
-        device = hidden_states.device
-
-        all_outputs = []
-        new_tgt_sizes = torch.zeros_like(tgt_sizes)
-
-        for i in range(B):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            h, w = tgt_sizes[i].tolist()
-            h, w = int(h), int(w)
-
-            x = hidden_states[start:end, :]
-            x = x.view(h, w, -1)
-            x = x.view(h // m1, m1, w // m2, m2, -1)
-            x = x.permute(0, 2, 1, 3, 4).contiguous()
-            num_windows = (h // m1) * (w // m2)
-            x = x.view(num_windows, m1 * m2, -1)
-
-            residual = x
-            x_normed = self.layer_norm1(x)
-            x = residual + self.self_attn(x_normed)
-
-            x_flat = x.reshape(num_windows, -1)
-            avg_residual = x.mean(dim=1)
-            x_flat = self.pre_norm(x_flat)
-            x_flat = self.linear_1(x_flat)
-            x_flat = self.act(x_flat)
-            x_flat = self.linear_2(x_flat)
-            x_out = x_flat + avg_residual
-
-            all_outputs.append(x_out)
-            new_tgt_sizes[i] = torch.tensor(
-                [h // m1, w // m2], device=device, dtype=tgt_sizes.dtype
-            )
-
-        new_hidden_states = torch.cat(all_outputs, dim=0)
-        new_seqlens = new_tgt_sizes[:, 0] * new_tgt_sizes[:, 1]
-        new_cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], device=device, dtype=torch.int32),
-                torch.cumsum(new_seqlens, dim=0, dtype=torch.int32),
-            ],
-            dim=0,
-        )
-        return new_hidden_states, new_tgt_sizes, new_cu_seqlens
-
-
-class DownsampleMLP5_0(nn.Module):
-    def __init__(self, hidden_size: int, llm_embed_dim: int, merge_kernel_size: Tuple[int, int] = (2, 2)):
-        super().__init__()
-        self.merge_kernel_size = merge_kernel_size
-        merged_dim = hidden_size * merge_kernel_size[0] * merge_kernel_size[1]
-        self.pre_norm = nn.LayerNorm(merged_dim, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(merged_dim, merged_dim, bias=True),
-            nn.GELU(),
-            nn.Linear(merged_dim, llm_embed_dim, bias=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(self.pre_norm(x))
-
-
-class Merger5_0(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        llm_embed_dim: int,
-        merge_kernel_size: Tuple[int, int] = (2, 2),
-        times: int = 1,
-    ):
-        super().__init__()
-        self.merge_kernel_size = merge_kernel_size
-        self.times = times
-        self.mlp = nn.ModuleList(
-            [
-                DownsampleMLP5_0(
-                    hidden_size,
-                    llm_embed_dim if i == times - 1 else hidden_size,
-                    merge_kernel_size,
-                )
-                for i in range(times)
-            ]
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        tgt_sizes: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> List[torch.Tensor]:
-        """
-        Args:
-            hidden_states: (total_tokens, D) packed tensor
-            tgt_sizes: (B, 2) patch grid sizes (h, w) per image
-            cu_seqlens: (B+1,) cumulative sequence lengths
-        Returns:
-            List of (num_output_tokens, llm_embed_dim) tensors, one per image
-        """
-        m1, m2 = self.merge_kernel_size
-        B = tgt_sizes.shape[0]
-
-        processed: List[torch.Tensor] = []
-        for i in range(B):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            h, w = tgt_sizes[i].tolist()
-            h, w = int(h), int(w)
-
-            x = hidden_states[start:end, :]
-            x = x.view(h, w, -1)
-            x = x.view(h // m1, m1, w // m2, m2, -1)
-            x = x.permute(0, 2, 1, 3, 4).contiguous()
-            x = x.view(h // m1 * w // m2, -1)
-
-            x = self.mlp[0](x)
-
-            if self.times > 1:
-                cur_h, cur_w = h // m1, w // m2
-                for t in range(1, self.times):
-                    x = x.view(cur_h, cur_w, -1)
-                    x = x.view(cur_h // m1, m1, cur_w // m2, m2, -1)
-                    x = x.permute(0, 2, 1, 3, 4).contiguous()
-                    x = x.view(cur_h // m1 * cur_w // m2, -1)
-                    x = self.mlp[t](x)
-                    cur_h, cur_w = cur_h // m1, cur_w // m2
-
-            processed.append(x)
-
-        return processed
-
-
-class MiniCPMV5_0(MiniCPMBaseModel):
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-        "gate_up_proj": [
-            "gate_proj",
-            "up_proj",
-        ],
-    }
-    supported_lora_modules = [
-        "fc1",
-        "fc2",
-        "out_proj",
-        "qkv_proj",
-        "o_proj",
-        "gate_up_proj",
-        "down_proj",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-    embedding_modules = {}
-    embedding_padding_modules = []
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (5, 0)
-
-        self.insert_layer_id = 6
-        vision_config = self.config.vision_config
-        self.vit_merger = ViTWindowAttentionMerger5_0(vision_config)
-
-    def init_llm(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        return Qwen3_5ForCausalLM(
-            config=config, quant_config=quant_config, prefix=prefix
-        )
-
-    def init_vision_module(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str = "",
-    ) -> nn.Module:
-        model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config, prefix=prefix
-        )
-        if self.config.drop_vision_last_layer:
-            model.encoder.layers = model.encoder.layers[:-1]
-
-        setattr(model, "embed_dim", model.embeddings.embed_dim)
-        setattr(model, "patch_size", model.embeddings.patch_size)
-        return model
-
-    def init_resampler(
-        self,
-        embed_dim: int,
-        vision_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        return Merger5_0(
-            hidden_size=vision_dim,
-            llm_embed_dim=embed_dim,
-        )
-
-    def get_vision_embedding(
-        self,
-        pixel_values: List[torch.Tensor],
-        patch_attn_mask: Optional[torch.Tensor] = None,
-        tgt_sizes: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        raise NotImplementedError("V5.0 uses get_image_feature directly")
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        hidden_states = self.vpm.embeddings(
-            pixel_values=all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-
-        cu_seqlens = self.vpm.compute_cu_seqlens(tgt_sizes, hidden_states)
-
-        for layer in self.vpm.encoder.layers[: self.insert_layer_id + 1]:
-            hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
-
-        hidden_states = hidden_states.squeeze(0)
-        hidden_states, tgt_sizes, cu_seqlens = self.vit_merger(
-            hidden_states, tgt_sizes, cu_seqlens
-        )
-        hidden_states = hidden_states.unsqueeze(0)
-
-        for layer in self.vpm.encoder.layers[self.insert_layer_id + 1 :]:
-            hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
-
-        hidden_states = self.vpm.post_layernorm(hidden_states)
-
-        vision_outputs = self.resampler(
-            hidden_states.squeeze(0), tgt_sizes, cu_seqlens
-        )
-        return torch.cat(vision_outputs, dim=0)
-
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
-
-        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-
-        return pattern.pad_input_tokens(input_ids, image_inputs)
-
-
-_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5, (5, 0): MiniCPMV5_0}
+_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
 
 
 class MiniCPMV:
@@ -1785,9 +1393,6 @@ class MiniCPMV:
         return self.minicpmv(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        version = get_version_by_config(self.config)
-        is_v5 = version == (5, 0)
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1796,63 +1401,42 @@ class MiniCPMV:
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if is_v5:
-            stacked_params_mapping += [
-                ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-                ("in_proj_qkvz.", "in_proj_z.", 3),
-                ("in_proj_ba.", "in_proj_b.", 0),
-                ("in_proj_ba.", "in_proj_a.", 1),
-            ]
 
         params_dict = dict(self.minicpmv.named_parameters())
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
+            if "rotary_emb.inv_freq~" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            if is_v5 and "lm_head" in name:
-                continue
 
-            if is_v5 and name.startswith("llm.model."):
-                name = "llm." + name[len("llm.model."):]
-
-            if is_v5 and name.startswith("llm."):
-                llm_suffix = name[len("llm."):]
-                if ".self_attn." in llm_suffix:
-                    llm_suffix = llm_suffix.replace(".self_attn.", ".")
-                if ".mlp." in llm_suffix:
-                    llm_suffix = llm_suffix.replace(".mlp.", ".")
-                name = "llm." + llm_suffix
-
-            if name.startswith("vpm."):
-                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
+            # adapt to VisionAttention
+            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
 
             if "sampler" in name:
-                if name not in params_dict:
-                    continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
+                # replace the name and load with customized loader
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                # # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -1860,4 +1444,606 @@ class MiniCPMV:
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = MiniCPMV
+# =================== MiniCPM-V 4.6 (independent architecture) ===================
+#
+# MiniCPM-V 4.6 introduces a new vision stack on top of the V4.5 family:
+#   * Qwen3.5 LLM (dense + gated delta-net hybrid) instead of Qwen3.
+#   * SigLIP (Idefics2) ViT encoder kept, but a window-attention + MLP merger
+#     is injected after ``config.insert_layer_id`` to halve the spatial grid.
+#   * The perceiver resampler is replaced by a lightweight MLP merger
+#     (``merger``) that maps vision features to the LLM embedding space.
+#   * Vision token count is dynamic (depends on image size and
+#     ``downsample_mode``).
+#
+# Because the HF architecture string is ``MiniCPMV4_6ForConditionalGeneration``,
+# this class is registered as its own SGLang entry-class (distinct from the
+# versioned ``MiniCPMV`` dispatcher above).
+
+
+class MiniCPMV4_6ViTWindowAttentionSelfAttn(nn.Module):
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        B, L, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).view(
+            B, L, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(
+            B, L, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(
+            B, L, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        attn_out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, scale=self.scale
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, self.embed_dim)
+        return self.out_proj(attn_out)
+
+
+class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
+    """Window-attention + MLP downsampling merger injected mid-ViT.
+
+    Each 2x2 window does a single self-attention pass (residual), then the
+    window is flattened and projected through a 2-layer MLP down to the ViT
+    hidden size, collapsing 4 tokens into 1.
+    """
+
+    def __init__(self, config: PretrainedConfig):
+        super().__init__()
+        self.window_kernel_size = (2, 2)
+        self.embed_dim = config.hidden_size
+
+        self.self_attn = MiniCPMV4_6ViTWindowAttentionSelfAttn(config)
+        self.layer_norm1 = nn.LayerNorm(
+            self.embed_dim, eps=config.layer_norm_eps,
+        )
+
+        hidden_4x = self.embed_dim * 4
+        inter_4x = config.intermediate_size * 4
+
+        self.pre_norm = nn.LayerNorm(hidden_4x, eps=config.layer_norm_eps)
+        self.linear_1 = nn.Linear(hidden_4x, inter_4x, bias=True)
+        self.act = nn.GELU(approximate="tanh")
+        self.linear_2 = nn.Linear(inter_4x, self.embed_dim, bias=True)
+
+    def _apply_window_attention(
+        self, valid_states: torch.Tensor, H: int, W: int,
+    ) -> torch.Tensor:
+        D = valid_states.shape[-1]
+        wh, ww = self.window_kernel_size
+        nh, nw = H // wh, W // ww
+        num_windows = nh * nw
+
+        x = valid_states.view(H, W, D)
+        x = x.view(nh, wh, nw, ww, D).permute(0, 2, 1, 3, 4).contiguous()
+        x = x.view(num_windows, wh * ww, D)
+
+        x = self.self_attn(x)
+
+        x = x.view(nh, nw, wh, ww, D).permute(0, 2, 1, 3, 4).contiguous()
+        return x.view(H * W, D)
+
+    def _apply_mlp_downsample(
+        self, valid_states: torch.Tensor, H: int, W: int,
+    ) -> torch.Tensor:
+        D = valid_states.shape[-1]
+        wh, ww = self.window_kernel_size
+        nh, nw = H // wh, W // ww
+
+        x = valid_states.view(H, W, D)
+        x = x.view(nh, wh, nw, ww, D).permute(0, 2, 1, 3, 4).contiguous()
+
+        residual = x.reshape(nh * nw, wh * ww, D).mean(dim=1)
+        x = x.reshape(nh * nw, wh * ww * D)
+
+        x = self.pre_norm(x)
+        x = self.linear_1(x)
+        x = self.act(x)
+        x = self.linear_2(x)
+        return x + residual
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        tgt_sizes: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        B, _L, D = hidden_states.shape
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        all_merged: List[torch.Tensor] = []
+        new_tgt_sizes = torch.zeros_like(tgt_sizes)
+
+        for b in range(B):
+            H, W = tgt_sizes[b].tolist()
+            H, W = int(H), int(W)
+            hs = hidden_states[b, : H * W, :]
+
+            residual = hs
+            hs = self.layer_norm1(hs)
+            hs = residual + self._apply_window_attention(hs, H, W)
+
+            wh, ww = self.window_kernel_size
+            new_H, new_W = H // wh, W // ww
+            all_merged.append(self._apply_mlp_downsample(hs, H, W))
+            new_tgt_sizes[b] = torch.tensor(
+                [new_H, new_W], device=device, dtype=tgt_sizes.dtype,
+            )
+
+        new_num_patches = new_tgt_sizes[:, 0] * new_tgt_sizes[:, 1]
+        new_max_patches = int(new_num_patches.max().item())
+        new_hidden = torch.zeros(
+            B, new_max_patches, D, device=device, dtype=dtype,
+        )
+        for b, merged in enumerate(all_merged):
+            new_hidden[b, : merged.shape[0], :] = merged
+
+        new_attention_mask: Optional[torch.Tensor] = None
+        if attention_mask is not None:
+            mask = torch.zeros(
+                B, new_max_patches, dtype=torch.bool, device=device,
+            )
+            for b in range(B):
+                mask[b, : int(new_num_patches[b].item())] = True
+            min_val = torch.finfo(dtype).min
+            new_attention_mask = (~mask).to(dtype=dtype) * min_val
+            new_attention_mask = new_attention_mask[:, None, None, :]
+
+        return new_hidden, new_tgt_sizes, new_attention_mask
+
+
+class MiniCPMV4_6DownsampleMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        llm_embed_dim: int,
+        merge_kernel_size: Tuple[int, int] = (2, 2),
+    ):
+        super().__init__()
+        self.merge_kernel_size = merge_kernel_size
+        self.hidden_size = (
+            hidden_size * merge_kernel_size[0] * merge_kernel_size[1]
+        )
+        self.pre_norm = nn.LayerNorm(self.hidden_size, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size, bias=True),
+            nn.GELU(),
+            nn.Linear(self.hidden_size, llm_embed_dim, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(self.pre_norm(x))
+
+
+class MiniCPMV4_6Merger(nn.Module):
+    """Final 2x2 merger projecting ViT features into the LLM embedding space.
+
+    Returns a list of per-slice tensors (dynamic vision token counts).
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        llm_embed_dim: int,
+        merge_kernel_size: Tuple[int, int] = (2, 2),
+        times: int = 1,
+    ):
+        super().__init__()
+        self.merge_kernel_size = merge_kernel_size
+        self.times = times
+        self.mlp = nn.ModuleList([
+            MiniCPMV4_6DownsampleMLP(
+                hidden_size,
+                llm_embed_dim if i == times - 1 else hidden_size,
+                merge_kernel_size,
+            )
+            for i in range(times)
+        ])
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        tgt_sizes: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        m1, m2 = self.merge_kernel_size
+        results: List[torch.Tensor] = []
+
+        for b in range(len(tgt_sizes)):
+            h, w = tgt_sizes[b].tolist()
+            h, w = int(h), int(w)
+            n_patches = h * w
+            hs = hidden_states[b, :n_patches, :]
+
+            hs = hs.reshape(h // m1, m1, w // m2, m2, -1)
+            hs = hs.permute(0, 2, 1, 3, 4).reshape(
+                (h // m1) * (w // m2), m1 * m2 * hs.shape[-1],
+            )
+            hs = self.mlp[0](hs)
+
+            if self.times > 1:
+                cur_h, cur_w = h // m1, w // m2
+                for t in range(1, self.times):
+                    cur_h, cur_w = cur_h // m1, cur_w // m2
+                    hs = hs.reshape(cur_h, m1, cur_w, m2, -1)
+                    hs = hs.permute(0, 2, 1, 3, 4).reshape(
+                        cur_h * cur_w, m1 * m2 * hs.shape[-1],
+                    )
+                    hs = self.mlp[t](hs)
+
+            results.append(hs)
+
+        return results
+
+
+class MiniCPMV4_6ForConditionalGeneration(nn.Module):
+    """SGLang entry class for MiniCPM-V 4.6.
+
+    Module layout (matches Qwen3-VL-style multimodal models):
+        self.vpm              - SigLIP ViT encoder (Idefics2VisionTransformer)
+        self.vit_merger       - mid-ViT window-attention + MLP merger
+        self.merger           - final 2x2 MLP merger -> LLM hidden size
+        self.model            - Qwen3_5ForCausalLM backbone (hidden states only)
+        self.lm_head          - ParallelLMHead, tied to model.embed_tokens
+                                when ``config.tie_word_embeddings`` is True
+        self.logits_processor - SGLang logits processor
+    """
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+    supported_lora_modules = [
+        "fc1",
+        "fc2",
+        "out_proj",
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    ]
+    embedding_modules = {}
+    embedding_padding_modules = []
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+        from sglang.srt.distributed import get_pp_group
+
+        self.config = config
+        self.text_config = config.text_config
+        self.quant_config = quant_config
+        self.pp_group = get_pp_group()
+
+        # ---- Vision tower ----
+        self.vpm = Idefics2VisionTransformer(
+            config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("vpm", prefix),
+        )
+        if getattr(config, "drop_vision_last_layer", False):
+            self.vpm.encoder.layers = self.vpm.encoder.layers[:-1]
+        setattr(self.vpm, "embed_dim", self.vpm.embeddings.embed_dim)
+        setattr(self.vpm, "patch_size", self.vpm.embeddings.patch_size)
+
+        # ---- Mid-encoder + final merger ----
+        self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(
+            config.vision_config,
+        )
+        self.merger = MiniCPMV4_6Merger(
+            hidden_size=config.vision_config.hidden_size,
+            llm_embed_dim=config.text_config.hidden_size,
+        )
+
+        # ---- Language model (Qwen3.5) ----
+        # ``Qwen3_5ForCausalLM`` here returns hidden states only; the LM head
+        # and logits processor live on this outer module (mirroring
+        # ``Qwen3VLForConditionalGeneration``).
+        self.model = Qwen3_5ForCausalLM(
+            config=config.text_config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        if self.pp_group.is_last_rank:
+            if (
+                self.pp_group.world_size == 1
+                and getattr(config, "tie_word_embeddings", False)
+            ):
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.text_config.vocab_size,
+                    config.text_config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            from sglang.srt.layers.vocab_parallel_embedding import (
+                PPMissingLayer,
+            )
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config.text_config)
+
+        self.insert_layer_id = getattr(config, "insert_layer_id", -1)
+        self.default_downsample_mode = getattr(
+            config, "downsample_mode", "16x",
+        )
+
+    # --------- Embedding helpers ---------
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
+
+    # --------- Vision forward ---------
+
+    def get_vision_hidden_states(
+        self,
+        pixel_values: List[torch.Tensor],
+        tgt_sizes: torch.Tensor,
+        downsample_mode: Optional[str] = None,
+    ) -> List[torch.Tensor]:
+        B = len(pixel_values)
+        P = pixel_values[0].shape[-2]
+        L = max(item.shape[-1] for item in pixel_values)
+        device = pixel_values[0].device
+        dtype = pixel_values[0].dtype
+
+        all_pixel_values = torch.zeros(
+            (B, 3, P, L), dtype=dtype, device=device,
+        )
+        for i, pv in enumerate(pixel_values):
+            all_pixel_values[i, ..., : pv.shape[-1]] = pv
+
+        num_patches = tgt_sizes[:, 0] * tgt_sizes[:, 1]
+        max_patches = int(num_patches.max().item())
+        patch_attn_mask = torch.zeros(
+            (B, max_patches), dtype=torch.bool, device=device,
+        )
+        for i in range(B):
+            patch_attn_mask[i, : int(num_patches[i].item())] = True
+
+        hidden_states = self.vpm.embeddings(
+            pixel_values=all_pixel_values,
+            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            tgt_sizes=tgt_sizes,
+        )
+
+        # Build attention mask for the mid-ViT merger (bool -> additive).
+        if torch.any(~patch_attn_mask):
+            min_val = torch.finfo(dtype).min
+            attention_mask = (~patch_attn_mask).to(dtype=dtype) * min_val
+            attention_mask = attention_mask[:, None, None, :]
+        else:
+            attention_mask = None
+
+        cu_seqlens = self.vpm.compute_cu_seqlens(tgt_sizes, hidden_states)
+
+        # SGLang's ``Idefics2EncoderLayer`` consumes ``cu_seqlens`` instead of
+        # a 4D attention mask; the mask is only used to drive the merger's
+        # padding-aware reshape, not the transformer layers themselves.
+        ds_mode = downsample_mode or self.default_downsample_mode
+        use_vit_merger = ds_mode != "4x" and self.insert_layer_id >= 0
+
+        for layer in self.vpm.encoder.layers[: self.insert_layer_id + 1]:
+            hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
+
+        if use_vit_merger:
+            hidden_states, tgt_sizes, attention_mask = self.vit_merger(
+                hidden_states, tgt_sizes, attention_mask,
+            )
+            cu_seqlens = self.vpm.compute_cu_seqlens(tgt_sizes, hidden_states)
+
+        for layer in self.vpm.encoder.layers[self.insert_layer_id + 1:]:
+            hidden_states = layer(hidden_states, cu_seqlens=cu_seqlens)
+
+        hidden_states = self.vpm.post_layernorm(hidden_states)
+
+        return self.merger(hidden_states, tgt_sizes)
+
+    def get_image_feature(
+        self, items: List[MultimodalDataItem],
+    ) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
+        pixel_values = flatten_nested_list([item.feature for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0,
+        ).to(device=self.vpm.embeddings.position_embedding.weight.device)
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+
+        # Per-slice pixel_values come in as (3, patch_size, patch_size * n)
+        # tensors; reorder to (3, P, L) and stack with padding in
+        # ``get_vision_hidden_states``.
+        pixel_values = [pv.to(device=device, dtype=dtype) for pv in pixel_values]
+
+        # No downsample_mode plumbing through SGLang multimodal items yet, so
+        # fall back to the model default ("16x", i.e. use the ViT merger).
+        slice_features = self.get_vision_hidden_states(
+            pixel_values, tgt_sizes,
+        )
+        return torch.cat(slice_features, dim=0)
+
+    # --------- Multimodal forward ---------
+
+    def pad_input_ids(
+        self, input_ids: List[int], image_inputs: MultimodalInputs,
+    ):
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
+
+        media_token_pairs = [
+            (im_start_id, im_end_id),
+            (slice_start_id, slice_end_id),
+        ]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        return pattern.pad_input_tokens(input_ids, image_inputs)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        hidden_states = general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            multimodal_model=self,
+            language_model=self.model,
+            positions=positions,
+        )
+
+        if self.pp_group.is_last_rank and not get_embedding:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch,
+            )
+        return hidden_states
+
+    # --------- Weight loading ---------
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
+        """Load HF weights into the SGLang parameter tree.
+
+        HF layout                              SGLang layout
+        -----------------------------------------------------------
+          model.vpm.*                    ->    vpm.*
+          model.vit_merger.*             ->    vit_merger.*
+          model.merger.*                 ->    merger.*
+          model.language_model.*         ->    model.*
+          lm_head.*                      ->    lm_head.*   (only when not tied)
+        When ``tie_word_embeddings`` is true the HF checkpoint omits
+        ``lm_head.weight`` entirely; we tie ``self.lm_head`` to
+        ``self.model.embed_tokens`` at init time, so embed_tokens loading
+        is sufficient.
+        """
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
+
+        tied = bool(getattr(self.config, "tie_word_embeddings", False))
+
+        params_dict = dict(self.named_parameters())
+        loaded_names: set = set()
+        for name, loaded_weight in weights:
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if (
+                "rotary_emb.cos_cached" in name
+                or "rotary_emb.sin_cached" in name
+            ):
+                continue
+
+            # Map HF prefixes into our tree.
+            if name.startswith("model.language_model."):
+                # Qwen3_5ForCausalLM is a flat module (no extra ``model.``
+                # wrapper inside our ``self.model``), so drop the HF
+                # ``model.language_model.`` level and remap to ``model.``.
+                name = "model." + name[len("model.language_model."):]
+                # Qwen3.5 full-attention layers store Q/K/V/O/norm directly on
+                # the layer (see sglang Qwen3_5ForCausalLM.load_weights); drop
+                # the ``.self_attn.`` level from HF names.
+                if ".self_attn." in name:
+                    name = name.replace(".self_attn.", ".")
+            elif name.startswith("model.vpm."):
+                name = "vpm." + name[len("model.vpm."):]
+            elif name.startswith("model.vit_merger."):
+                name = "vit_merger." + name[len("model.vit_merger."):]
+            elif name.startswith("model.merger."):
+                name = "merger." + name[len("model.merger."):]
+            elif name == "lm_head.weight":
+                if tied:
+                    # lm_head is tied to model.embed_tokens, skip to avoid
+                    # redundant copy (and to avoid a shape mismatch when the
+                    # head is a VocabParallelEmbedding reference).
+                    continue
+                # else keep as "lm_head.weight"
+
+            # ``VisionAttention`` renames ``out_proj`` -> ``proj`` for the
+            # SigLIP tower only. Do not touch our standalone ``vit_merger``
+            # self-attention (plain nn.Linear with bias ``out_proj``).
+            if name.startswith("vpm."):
+                name = name.replace(
+                    "self_attn.out_proj", "self_attn.proj",
+                )
+
+            matched_stacked = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                mapped = name.replace(weight_name, param_name)
+                if mapped.endswith(".bias") and mapped not in params_dict:
+                    continue
+                if mapped not in params_dict:
+                    continue
+                param = params_dict[mapped]
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader,
+                )
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_names.add(mapped)
+                matched_stacked = True
+                break
+            if matched_stacked:
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(
+                param, "weight_loader", default_weight_loader,
+            )
+            weight_loader(param, loaded_weight)
+            loaded_names.add(name)
+
+        missing = sorted(set(params_dict) - loaded_names)
+        if missing:
+            import logging as _logging
+            _logging.getLogger("sglang.minicpmv4_6").warning(
+                "MiniCPMV4_6: %d parameter(s) not loaded from checkpoint "
+                "(showing first 10): %s",
+                len(missing),
+                missing[:10],
+            )
+
+
+EntryClass = [MiniCPMV, MiniCPMV4_6ForConditionalGeneration]

@@ -79,6 +79,7 @@ from sglang.srt.configs import (
     KimiLinearConfig,
     KimiVLConfig,
     LongcatFlashConfig,
+    MiniCPMV4_6Config,
     MultiModalityConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -123,6 +124,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     JetNemotronConfig,
     JetVLMConfig,
     KimiK25Config,
+    MiniCPMV4_6Config,
     Step3p5Config,
 ]
 
