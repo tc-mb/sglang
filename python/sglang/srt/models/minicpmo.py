@@ -1466,7 +1466,9 @@ class MiniCPMO4_5(MiniCPMBaseModel):
     ) -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        self.llm = self.init_llm(config=config, quant_config=quant_config, prefix=prefix)
+        self.llm = self.init_llm(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
 
         self.embed_dim = self.llm.config.hidden_size
 
@@ -1978,10 +1980,13 @@ class MiniCPMO2_6(MiniCPMBaseModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__(config=config, quant_config=quant_config)
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        self.llm = self.init_llm(config=config, quant_config=quant_config)
+        self.llm = self.init_llm(
+            config=config, quant_config=quant_config, prefix=prefix
+        )
 
         self.embed_dim = self.llm.config.hidden_size
 
@@ -2543,13 +2548,12 @@ class MiniCPMO:
             )
 
         try:
-            minicpmo = instance_class(
+            self.minicpmo = instance_class(
                 config=config, quant_config=quant_config, prefix=prefix
             )
-            self.minicpmo = minicpmo
         except Exception as e:
-            print(f"Failed to instantiate MiniCPMO: {e}")
-            raise e
+            logger.error(f"Failed to instantiate MiniCPMO: {e}")
+            raise
         self.config = config
 
     def __getattr__(self, name):
@@ -2561,82 +2565,7 @@ class MiniCPMO:
         return self.minicpmo(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.minicpmo.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq~" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-
-            # For weight_norm parametrization, handle both old and new formats
-            if self.config.init_tts and "tts" in name:
-                # Handle loading from older checkpoints with weight_g/weight_v format
-                if ".weight_g" in name or ".weight_v" in name:
-                    name = name.replace(
-                        ".weight_g", ".parametrizations.weight.original0"
-                    )
-                    name = name.replace(
-                        ".weight_v", ".parametrizations.weight.original1"
-                    )
-                elif ".weight" in name and name not in params_dict:
-                    param_name = name.replace(
-                        ".weight", ".parametrizations.weight.original0"
-                    )
-                    if param_name in params_dict:
-                        name = param_name
-
-            # adapt to VisionAttention
-            if "vpm" in name:
-                name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
-
-            if not self.config.init_tts and "tts" in name:
-                continue
-            if not self.config.init_audio and ("apm" in name or "audio" in name):
-                continue
-            if not self.config.init_vision and "vpm" in name:
-                continue
-
-            if (
-                "sampler" in name
-                or "apm" in name
-                or ("tts" in name and "self_attn" in name)
-                or ("tts.model.layers" in name and ".mlp" in name)
-            ):
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # replace the name and load with customized loader
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        return self.minicpmo.load_weights(weights)
 
 
 EntryClass = [MiniCPMO]
