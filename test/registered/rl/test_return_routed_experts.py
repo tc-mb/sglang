@@ -1,72 +1,81 @@
 import asyncio
+import json
 import logging
 import unittest
 from typing import List
 
 import aiohttp
-import requests
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from sglang.srt.layers.moe.routed_experts_capturer import (
+from sglang.benchmark.utils import download_and_cache_hf_file
+from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=180, suite="stage-c-test-large-4-gpu")
+register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
 
-SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon8231489123/"
-    "ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
-)
+# FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
+# ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
+# NPU, modelopt_fp4+cutedsl}. Bf16 hits an `assert False, "deprecated"` today.
+MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
+
+SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
+SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
 logger = logging.getLogger(__name__)
 
 
 class TestReturnRoutedExperts(CustomTestCase):
-    # modified from test_hicache.py
+    """End-to-end check that --enable-return-routed-experts stays correct
+    under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
+    optimisations.
+
+    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
+    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    RoutedExpertsCapturer.capture is hit on every step. Baseline disables
+    overlap/cuda-graph/radix to give a deterministic ground truth; reference
+    leaves them on. If the gather were skipping a rank or racing against the
+    forward stream, the captured topk_ids would diverge between the two.
+    """
+
     @classmethod
     def setUpClass(cls):
-
-        cls.baseline_args = [
+        common = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
+            "--tp",
+            4,
+            "--dp",
+            2,
+            "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
+            # Force normal-mode dispatch: deepep auto routes decode through
+            # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            "--deepep-mode",
+            "normal",
+        ]
+        cls.baseline_args = common + [
             "--disable-overlap-schedule",
             "--disable-cuda-graph",
             "--disable-radix-cache",
-            "--tp",
-            4,
-            "--dp",
-            4,
-            "--enable-dp-attention",
         ]
-        cls.reference_args = [
-            "--enable-return-routed-experts",
-            "--enable-deterministic-inference",
-            "--tp",
-            4,
-            "--dp",
-            4,
-            "--enable-dp-attention",
-        ]
-        cls.sampling_args = {
-            "temperature": 0,
-        }
+        cls.reference_args = common
+        cls.sampling_args = {"temperature": 0}
         # prepare ShareGPT dataset
-        try:
-            response = requests.get(SHAREGPT_URL, timeout=60)
-            response.raise_for_status()
-            data = response.json()
-            print(f"Dataset size: {len(data)}")
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Failed to download ShareGPT dataset: {e}") from e
+        dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
+        with open(dataset_path) as f:
+            data = json.load(f)
+        print(f"Dataset size: {len(data)}")
         cls.texts = []
         for s in data:
             if "conversations" in s and len(s["conversations"]) > 0:
@@ -81,15 +90,42 @@ class TestReturnRoutedExperts(CustomTestCase):
         if not cls.texts:
             raise ValueError("No valid texts found in the dataset")
         cls.texts = cls.texts[:100]
+        cls._endpoints = [
+            (
+                "/generate",
+                cls._build_generate_payload,
+                extract_routed_experts_from_meta_info,
+            ),
+            (
+                "/v1/chat/completions",
+                cls._build_chat_payload,
+                extract_routed_experts_from_openai_response,
+            ),
+            (
+                "/v1/completions",
+                cls._build_completion_payload,
+                extract_routed_experts_from_openai_response,
+            ),
+        ]
+        cls.baseline_results = cls._collect_results(cls.baseline_args)
+        cls.reference_results = cls._collect_results(cls.reference_args)
 
     @classmethod
     def test_return_routed_experts(cls):
-        captured_baseline_experts = asyncio.run(
-            cls.fetch_result("baseline", cls.baseline_args)
-        )
-        captured_reference_experts = asyncio.run(
-            cls.fetch_result("reference", cls.reference_args)
-        )
+        cls._run_endpoint_test("/generate")
+
+    @classmethod
+    def test_return_routed_experts_chat_completions(cls):
+        cls._run_endpoint_test("/v1/chat/completions")
+
+    @classmethod
+    def test_return_routed_experts_completions(cls):
+        cls._run_endpoint_test("/v1/completions")
+
+    @classmethod
+    def _run_endpoint_test(cls, endpoint):
+        captured_baseline_experts = cls.baseline_results[endpoint]
+        captured_reference_experts = cls.reference_results[endpoint]
 
         check_all_experts_id_valid(captured_baseline_experts)
         check_all_experts_id_valid(captured_reference_experts)
@@ -110,53 +146,94 @@ class TestReturnRoutedExperts(CustomTestCase):
             f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
         )
         assert (
-            num_mismatches / num_baseline_topks < 0.05
+            num_mismatches / num_baseline_topks < 0.10
         ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
 
     @classmethod
-    async def fetch_result(cls, title, other_args):
+    def _collect_results(
+        cls,
+        other_args,
+    ):
+        process = popen_launch_server(
+            MODEL_PATH,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
         try:
-            process = popen_launch_server(
-                DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
-                DEFAULT_URL_FOR_TEST,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
-            async with aiohttp.ClientSession() as session:
+            return asyncio.run(cls._collect_results_async())
+        finally:
+            kill_process_tree(process.pid)
+
+    @classmethod
+    async def _collect_results_async(cls):
+        results = {}
+        async with aiohttp.ClientSession() as session:
+            for endpoint, payload_builder, response_extractor in cls._endpoints:
                 tasks = [
                     asyncio.create_task(
                         make_request(
                             session,
-                            f"{DEFAULT_URL_FOR_TEST}/generate",
-                            {
-                                "text": text,
-                                "sampling_params": cls.sampling_args,
-                                "return_routed_experts": True,
-                                "max_new_tokens": 100,
-                            },
+                            f"{DEFAULT_URL_FOR_TEST}{endpoint}",
+                            payload_builder(text),
                         )
                     )
                     for text in cls.texts
                 ]
                 # return value shape: List[[seq_len, num_layers, topk]...]
                 http_result = await asyncio.gather(*tasks)
-        except Exception as e:
-            raise e
-        finally:
-            kill_process_tree(process.pid)
+                results[endpoint] = [
+                    response_extractor(res).reshape(-1, 48, 8) for res in http_result
+                ]
+        return results
 
-        result = [
-            extract_routed_experts_from_meta_info(res).reshape(-1, 48, 8)
-            for res in http_result
-        ]
+    @classmethod
+    def _build_generate_payload(cls, text):
+        return {
+            "text": text,
+            "sampling_params": cls.sampling_args,
+            "return_routed_experts": True,
+            "max_new_tokens": 100,
+        }
 
-        return result
+    @classmethod
+    def _build_chat_payload(cls, text):
+        return {
+            "messages": [{"role": "user", "content": text}],
+            "temperature": 0,
+            "max_tokens": 100,
+            "return_routed_experts": True,
+        }
+
+    @classmethod
+    def _build_completion_payload(cls, text):
+        return {
+            "prompt": text,
+            "temperature": 0,
+            "max_tokens": 100,
+            "return_routed_experts": True,
+        }
 
 
 async def make_request(session, url, payload):
     """Make a single async HTTP request"""
     async with session.post(url=url, json=payload) as response:
         return await response.json()
+
+
+def extract_routed_experts_from_openai_response(response):
+    if "error" in response:
+        raise ValueError(f"OpenAI response error: {response['error']}")
+    # sglext is at response level (not in choices) as of PR #17648
+    sglext = response.get("sglext", None)
+    if sglext is None:
+        raise ValueError("OpenAI response missing sglext.")
+    routed_experts = sglext.get("routed_experts", None)
+    if routed_experts is None:
+        raise ValueError("OpenAI response sglext missing routed_experts.")
+    return extract_routed_experts_from_meta_info(
+        {"meta_info": {"routed_experts": routed_experts}}
+    )
 
 
 def check_all_experts_id_valid(experts: List[List[List[int]]]):

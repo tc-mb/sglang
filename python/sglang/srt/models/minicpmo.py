@@ -44,6 +44,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
+    MultimodalInputFormat,
     MultimodalInputs,
     flatten_nested_list,
 )
@@ -2364,6 +2365,10 @@ class MiniCPMO2_6(MiniCPMBaseModel):
         return audio_embs
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
         # list of tensors
         pixel_values = flatten_nested_list([item.feature for item in items])
         tgt_sizes = torch.stack(
