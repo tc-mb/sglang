@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
+import re
 import types
 from functools import partial
 from itertools import chain
@@ -1400,6 +1401,10 @@ class MiniCPMV4_6(MiniCPMBaseModel):
     embedding_modules = {}
     embedding_padding_modules = []
 
+    # Versions this class implements; 4.7 reuses it with a different checkpoint
+    # layout (see ``MiniCPMV4_7``).
+    supported_versions = ((4, 6),)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1407,7 +1412,7 @@ class MiniCPMV4_6(MiniCPMBaseModel):
         prefix: str = "",
     ):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        assert self.version == (4, 6)
+        assert self.version in self.supported_versions
         # ``Qwen3_5ForCausalLM`` returns plain hidden states (body only, no LM
         # head, no LogitsProcessor). Add them here so the downstream sampler
         # sees a ``LogitsProcessorOutput``. With ``tie_word_embeddings=True``
@@ -1616,11 +1621,62 @@ class MiniCPMV4_6(MiniCPMBaseModel):
                 weight_loader(param, loaded_weight)
 
 
+class MiniCPMV4_7(MiniCPMV4_6):
+    """MiniCPM-V 4.7 (OCR).
+
+    Same modules as 4.6 — the checkpoints only differ in how they name their
+    tensors: the OCR release keeps the sglang-style ``llm`` / ``vpm`` /
+    ``resampler`` top-level prefixes (plus a top-level ``vit_merger``) instead
+    of the ``model.{language_model,vision_tower,merger}`` nesting 4.6 uses, and
+    stores the connector MLPs as an ``nn.Sequential`` (``mlp.0`` / ``mlp.2``)
+    rather than named ``linear_1`` / ``linear_2`` layers.
+
+    ``downsample_mode`` ("16x", the default, or "4x" which keeps 4x more visual
+    tokens by skipping the mid-ViT merger) is read from the config, so it can
+    be selected per deployment with
+    ``--json-model-override-args '{"downsample_mode": "4x"}'``.
+    """
+
+    supported_versions = ((4, 7),)
+
+    @staticmethod
+    def _remap_weight_name(name: str) -> Optional[str]:
+        """OCR checkpoint tensor name -> the 4.6 name for the same parameter."""
+        if name == "llm.lm_head.weight":
+            # ``Qwen3_5ForCausalLM`` is body-only; the head lives on the
+            # wrapper, tied to the embedding for every released checkpoint.
+            return "lm_head.weight"
+        if name.startswith("llm.model."):
+            return "model.language_model." + name[len("llm.model.") :]
+        if name.startswith("vit_merger."):
+            return "model.vision_tower.vit_merger." + name[len("vit_merger.") :]
+        if name.startswith("vpm."):
+            return "model.vision_tower." + name[len("vpm.") :]
+        if name.startswith("resampler."):
+            suffix = name[len("resampler.") :]
+            suffix = re.sub(r"^mlp\.(\d+)\.mlp\.0\.", r"mlp.\1.linear_1.", suffix)
+            suffix = re.sub(r"^mlp\.(\d+)\.mlp\.2\.", r"mlp.\1.linear_2.", suffix)
+            return "model.merger." + suffix
+        return name
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
+
+        def remapped():
+            for name, weight in weights:
+                if name == "llm.lm_head.weight" and tie_word_embeddings:
+                    continue
+                yield self._remap_weight_name(name), weight
+
+        return super().load_weights(remapped())
+
+
 _SUPPORT_VERSION = {
     (2, 6): MiniCPMV2_6,
     (4, 0): MiniCPMV4_0,
     (4, 5): MiniCPMV4_5,
     (4, 6): MiniCPMV4_6,
+    (4, 7): MiniCPMV4_7,
 }
 
 
@@ -1753,4 +1809,12 @@ class MiniCPMV4_6ForConditionalGeneration(MiniCPMV):
     pass
 
 
-EntryClass = [MiniCPMV, MiniCPMV4_6ForConditionalGeneration]
+class MiniCPMV4_7ForConditionalGeneration(MiniCPMV):
+    pass
+
+
+EntryClass = [
+    MiniCPMV,
+    MiniCPMV4_6ForConditionalGeneration,
+    MiniCPMV4_7ForConditionalGeneration,
+]

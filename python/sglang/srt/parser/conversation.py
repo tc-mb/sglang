@@ -1131,9 +1131,22 @@ def get_model_type(model_path: str) -> Optional[str]:
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
-        return config.get("model_type")
     except (IOError, json.JSONDecodeError):
         return None
+
+    from sglang.srt.configs.minicpmv4_7 import (
+        MiniCPMV4_7Config,
+        is_flat_ocr_config_dict,
+    )
+
+    if is_flat_ocr_config_dict(config):
+        # The MiniCPM-V OCR releases announce the generic "minicpmv" model_type
+        # but ship their own chat_template.jinja; report the type they are
+        # normalized to so the legacy `minicpmv` conv template (which encodes
+        # the 2.x-4.5 `(<image>./</image>)` placeholder) is not matched.
+        return MiniCPMV4_7Config.model_type
+
+    return config.get("model_type")
 
 
 @register_conv_template_matching_function
@@ -1182,11 +1195,11 @@ def match_minicpm(model_path: str):
     # must NOT fall back to the legacy `minicpmv` conv template (which encodes
     # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
     model_type = get_model_type(model_path)
-    if model_type == "minicpmv4_6":
+    if model_type in ("minicpmv4_6", "minicpmv4_7"):
         return None
     # For HF-hub paths (where config.json isn't on local disk yet), fall back
     # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
-    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+    if re.search(r"minicpm-(v|o)-4[._][67]", model_path, re.IGNORECASE):
         return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:

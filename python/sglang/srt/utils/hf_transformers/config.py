@@ -19,6 +19,7 @@ from typing import Optional
 from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from sglang.srt.configs.minicpmv4_7 import MiniCPMV4_7Config, is_flat_ocr_config
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -89,6 +90,15 @@ class HfModelConfigParser(ModelConfigParserBase):
                 revision=revision,
                 **kwargs,
             )
+
+        if is_flat_ocr_config(config):
+            # Released MiniCPM-V OCR checkpoints keep the Qwen3.5 backbone
+            # fields flat and announce the generic "MiniCPMV" architecture.
+            # Convert to the 4.6-style nesting and name the architecture so the
+            # model / multimodal-processor registries resolve the OCR classes
+            # instead of the legacy 2.6-4.5 ones.
+            config = MiniCPMV4_7Config.from_flat_config(config)
+            _set_architectures(config, "MiniCPMV4_7ForConditionalGeneration")
 
         if (
             config.architectures is not None
