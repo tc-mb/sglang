@@ -1,7 +1,12 @@
 """Unit tests for srt/parser/jinja_template_utils.py"""
 
+import copy
 import unittest
 
+from sglang.srt.entrypoints.openai.chat_encoding import (
+    template_reads_reasoning,
+    template_reads_thinking,
+)
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     jinja_template_may_reorder_tool_results,
@@ -17,6 +22,90 @@ register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
 class TestTemplateContentFormatDetection(CustomTestCase):
     """Test template content format detection functionality."""
+
+    def test_reasoning_field_access_syntax(self):
+        """Bracket/get access must not lose history that dot access preserves."""
+        for field, detect in (
+            ("thinking", template_reads_thinking),
+            ("reasoning_content", template_reads_reasoning),
+        ):
+            for expression in (
+                f"message.{field}",
+                f"message['{field}']",
+                f"messages[0].get('{field}', '')",
+                f"'{field}'\n in message",
+                f"'{field}' not in message",
+                f"messages | map(attribute='{field}', default='') | join('')",
+                f"messages | selectattr('{field}') | list",
+                f"messages | rejectattr('{field}') | list",
+            ):
+                with self.subTest(field=field, expression=expression):
+                    self.assertTrue(detect("{{ " + expression + " }}"))
+            for template in (
+                "{# " + field + " #}{{ message.content }}",
+                "{{ 'message." + field + "' }}",
+                "{{ '" + field + "' in ['" + field + "'] }}",
+                "{{ '" + field + "' in {'" + field + "': true} }}",
+                "{{ invalid",
+                None,
+                {"default": "{{ message." + field + " }}"},
+            ):
+                with self.subTest(field=field, template=template):
+                    self.assertFalse(detect(template))
+
+    def test_thinking_parts_are_preserved_in_every_content_format(self):
+        """Structured templates used to retain only the first thinking block."""
+        for content_format, v32 in (
+            ("string", False),
+            ("openai", False),
+            ("openai", True),
+        ):
+            for first, second, expected in (
+                ("A", "B", "A\nB"),
+                ("", "B", "\nB"),
+                (" \nA ", "B\n", " \nA \nB\n"),
+                ("", "", "\n"),
+            ):
+                for canonical, reasoning in (
+                    ({}, expected),
+                    ({"reasoning_content": None}, expected),
+                    ({"reasoning_content": ""}, ""),
+                    ({"reasoning_content": "canonical"}, "canonical"),
+                ):
+                    with self.subTest(
+                        content_format=content_format,
+                        v32=v32,
+                        first=first,
+                        second=second,
+                        canonical=canonical,
+                    ):
+                        message = {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": first},
+                                {"type": "text", "text": "visible"},
+                                {"type": "reasoning", "text": second},
+                            ],
+                            **canonical,
+                        }
+                        original = copy.deepcopy(message)
+                        result = process_content_for_template_format(
+                            message,
+                            content_format,
+                            [],
+                            [],
+                            [],
+                            [],
+                            use_dpsk_v32_encoding=v32,
+                        )
+                        self.assertEqual(result["reasoning_content"], reasoning)
+                        self.assertEqual(
+                            result["content"],
+                            "visible"
+                            if content_format == "string" or v32
+                            else [{"type": "text", "text": "visible"}],
+                        )
+                        self.assertEqual(message, original)
 
     def test_detect_tool_result_id_association(self):
         attribute_template = """

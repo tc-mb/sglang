@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv41
+from sglang.srt.parser.jinja_template_utils import jinja_template_reads_field
 
 logger = logging.getLogger(__name__)
 
@@ -226,21 +227,13 @@ def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
 
 def template_reads_reasoning(template: Any) -> bool:
     """True when the Jinja chat template inspects `reasoning_content`."""
-    if not isinstance(template, str):
-        return False
-    return "reasoning_content" in template
+    return jinja_template_reads_field(template, "reasoning_content")
 
 
 def template_reads_thinking(template: Any) -> bool:
     """True when the Jinja chat template inspects `message.thinking` / `thinking`
     (e.g. `openai/gpt-oss-*` Harmony templates)."""
-    if not isinstance(template, str):
-        return False
-    return (
-        ".thinking" in template
-        or '"thinking" in ' in template
-        or "'thinking' in " in template
-    )
+    return jinja_template_reads_field(template, "thinking")
 
 
 def spec_renders_prompt_ids(spec: Optional[str]) -> bool:

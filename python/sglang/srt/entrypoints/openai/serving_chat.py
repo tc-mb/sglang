@@ -1690,8 +1690,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self.tokenizer_manager.tokenizer is not None
                 else None
             )
-            populates_thinking_field = (
-                chat_encoding.template_reads_thinking(tokenizer_chat_template)
+            populates_thinking_field = chat_encoding.template_reads_thinking(
+                tokenizer_chat_template
+            )
+            merges_tool_preamble = (
+                self.is_gpt_oss
                 and not chat_encoding.template_reads_reasoning(tokenizer_chat_template)
             )
             for msg_dict in copy.deepcopy(messages):
@@ -1718,7 +1721,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     and "thinking" not in processed_msg
                 ):
                     processed_msg["thinking"] = processed_msg["reasoning_content"]
-                    if processed_msg.get("tool_calls") and processed_msg.get("content"):
+                    # The thinking-only GPT-OSS template forbids both fields on a
+                    # tool-call turn. Canonical-aware/custom templates must stay
+                    # in charge of their separate reasoning and content channels.
+                    if (
+                        merges_tool_preamble
+                        and processed_msg.get("tool_calls")
+                        and isinstance(processed_msg.get("content"), str)
+                        and processed_msg["content"]
+                    ):
                         processed_msg["thinking"] = (
                             f"{processed_msg['thinking']}\n{processed_msg['content']}"
                         )

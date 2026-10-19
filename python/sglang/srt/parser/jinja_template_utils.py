@@ -5,6 +5,7 @@ including content format detection and message processing.
 """
 
 import logging
+from functools import lru_cache
 
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
@@ -180,6 +181,73 @@ def jinja_template_may_reorder_tool_results(chat_template: str) -> bool:
     return False
 
 
+def jinja_template_reads_field(chat_template: object, field: str) -> bool:
+    """Inspect field access syntax, not mentions in comments or literal text.
+
+    This does not evaluate branches or prove that a field is rendered. As with
+    tool-result detection, it recognizes static accesses, including aliases for
+    the message variable. Non-string/custom templates have no AST to inspect.
+    """
+    return isinstance(chat_template, str) and _jinja_template_reads_field(
+        chat_template, field
+    )
+
+
+@lru_cache(maxsize=128)
+def _jinja_template_reads_field(chat_template: str, field: str) -> bool:
+    # Pure, bounded memoization by template text: do not parse on every request,
+    # and do not retain stale capabilities when the tokenizer template changes.
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    def is_field(node: jinja2.nodes.Node) -> bool:
+        return isinstance(node, jinja2.nodes.Const) and node.value == field
+
+    for node in jinja_ast.find_all(jinja2.nodes.Getattr):
+        if node.attr == field:
+            return True
+    for node in jinja_ast.find_all(jinja2.nodes.Getitem):
+        if is_field(node.arg):
+            return True
+    for node in jinja_ast.find_all(jinja2.nodes.Call):
+        if (
+            isinstance(node.node, jinja2.nodes.Getattr)
+            and node.node.attr == "get"
+            and node.args
+            and is_field(node.args[0])
+        ):
+            return True
+    for node in jinja_ast.find_all(jinja2.nodes.Compare):
+        if is_field(node.expr) and any(
+            operand.op in ("in", "notin")
+            and not isinstance(
+                operand.expr,
+                (
+                    jinja2.nodes.Const,
+                    jinja2.nodes.List,
+                    jinja2.nodes.Tuple,
+                    jinja2.nodes.Dict,
+                ),
+            )
+            for operand in node.ops
+        ):
+            return True
+    for node in jinja_ast.find_all(jinja2.nodes.Filter):
+        if (
+            node.name in ("selectattr", "rejectattr")
+            and node.args
+            and is_field(node.args[0])
+        ):
+            return True
+        if node.name == "map" and any(
+            keyword.key == "attribute" and is_field(keyword.value)
+            for keyword in node.kwargs
+        ):
+            return True
+    return False
+
+
 def process_content_for_template_format(
     msg_dict: dict,
     content_format: str,
@@ -207,6 +275,24 @@ def process_content_for_template_format(
     if not isinstance(msg_dict.get("content"), list):
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
+
+    # Reasoning is independent of the template's content representation. Keep
+    # every block, including empty strings, without mutating the caller's message.
+    # An explicit canonical value (even "") takes precedence over content parts.
+    if msg_dict.get("reasoning_content") is None:
+        thinking_parts = []
+        for chunk in msg_dict["content"]:
+            if isinstance(chunk, dict) and chunk.get("type") in (
+                "thinking",
+                "reasoning",
+            ):
+                value = chunk.get("thinking")
+                if value is None:
+                    value = chunk.get("text")
+                if isinstance(value, str):
+                    thinking_parts.append(value)
+        if thinking_parts:
+            msg_dict = {**msg_dict, "reasoning_content": "\n".join(thinking_parts)}
 
     if content_format == "openai" or use_dpsk_v32_encoding:
         # OpenAI format: preserve structured content list, normalize types
@@ -277,15 +363,6 @@ def process_content_for_template_format(
                 elif chunk_type == "tool_reference":
                     # Preserve this extension because GLM templates resolve referenced tool schemas by function name.
                     processed_content_parts.append(chunk)
-                elif chunk_type in ("thinking", "reasoning"):
-                    thinking_val = chunk.get("thinking")
-                    if thinking_val is None:
-                        thinking_val = chunk.get("text")
-                    if (
-                        isinstance(thinking_val, str)
-                        and msg_dict.get("reasoning_content") is None
-                    ):
-                        msg_dict["reasoning_content"] = thinking_val
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
@@ -299,24 +376,14 @@ def process_content_for_template_format(
     elif content_format == "string":
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
-        thinking_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict):
-                if chunk.get("type") in ("text", "input_text"):
-                    text_parts.append(chunk["text"])
-                elif chunk.get("type") in ("thinking", "reasoning"):
-                    thinking_val = chunk.get("thinking")
-                    if thinking_val is None:
-                        thinking_val = chunk.get("text")
-                    if isinstance(thinking_val, str):
-                        thinking_parts.append(thinking_val)
+            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
+                text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
             # need to be inserted differently
 
         new_msg = msg_dict.copy()
-        if thinking_parts and new_msg.get("reasoning_content") is None:
-            new_msg["reasoning_content"] = "\n".join(thinking_parts)
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg

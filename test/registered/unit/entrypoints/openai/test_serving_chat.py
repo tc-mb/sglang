@@ -25,6 +25,8 @@ from unittest.mock import Mock, patch
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
+from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.openai.chat_encoding import (
     resolve_dsv4_reasoning_effort_profile,
 )
@@ -44,6 +46,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.jinja_template_utils import (
     jinja_template_may_reorder_tool_results,
 )
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
@@ -4688,83 +4691,325 @@ class ServingChatTestCase(CustomTestCase):
                 ):
                     self.chat._apply_jinja_template(request, None, False)
 
-    def test_gpt_oss_thinking_history_replay_in_jinja_template(self):
-        gpt_oss_template_str = (
-            "{%- for message in messages -%}"
-            "{%- if message.role == 'assistant' -%}"
-            "{%- if 'tool_calls' in message -%}"
-            "{%- if message.content and message.thinking -%}"
-            "{{ raise_exception('Cannot pass both content and thinking in an assistant message with tool calls!') }}"
-            "{%- elif message.thinking -%}"
-            "<|start|>assistant<|channel|>analysis<|message|>{{ message.thinking }}<|end|>"
-            "{%- endif -%}"
-            "<|start|>assistant to=functions.{{ message.tool_calls[0].function.name }}<|call|>"
-            "{%- elif loop.last and not add_generation_prompt -%}"
-            "{%- if 'thinking' in message -%}"
-            "<|start|>assistant<|channel|>analysis<|message|>{{ message.thinking }}<|end|>"
-            "{%- endif -%}"
-            "<|start|>assistant<|channel|>final<|message|>{{ message.content }}<|return|>"
-            "{%- else -%}"
-            "<|start|>assistant<|channel|>final<|message|>{{ message.content }}<|end|>"
-            "{%- endif -%}"
-            "{%- endif -%}"
-            "{%- endfor -%}"
-        )
-        compiled = _compile_jinja_template(gpt_oss_template_str)
-        self.tm.tokenizer.chat_template = gpt_oss_template_str
-        self.tm.tokenizer.apply_chat_template.side_effect = (
-            lambda messages, add_generation_prompt=True, **kwargs: compiled.render(
+    _GPT_OSS_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather in a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+    _GPT_OSS_CALL = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city":"SF"}'},
+    }
+
+    def _use_history_template(self, template, *, gpt_oss=False):
+        compiled = _compile_jinja_template(template)
+
+        def render(messages, add_generation_prompt=True, **kwargs):
+            return compiled.render(
                 messages=messages,
                 add_generation_prompt=add_generation_prompt,
+                strftime_now=lambda fmt: "2026-01-01",
+                **kwargs,
             )
-        )
+
+        self.tm.tokenizer.chat_template = template
+        self.tm.tokenizer.apply_chat_template.side_effect = render
+        self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.chat_encoding_spec = None
+        self.chat.is_gpt_oss = gpt_oss
+        if gpt_oss:
+            self.chat.reasoning_parser = self.chat.tool_call_parser = "gpt-oss"
+            self.chat._reasoning_detector = ReasoningParser(
+                model_type="gpt-oss", stream_reasoning=True
+            ).detector
+        return render
 
-        tool_call_payload = [
+    def _use_gpt_oss_history_template(self):
+        template = (
+            Path(__file__).parent / "fixtures" / "gpt_oss_chat_template.jinja"
+        ).read_text(encoding="utf-8")
+        return self._use_history_template(template, gpt_oss=True)
+
+    def test_gpt_oss_thinking_history_replay_in_jinja_template(self):
+        """#44931: all history forms must reach the real template's analysis channel."""
+        render = self._use_gpt_oss_history_template()
+        reasoning = "Need\nweather tool"
+        call = copy.deepcopy(self._GPT_OSS_CALL)
+        reference_call = copy.deepcopy(call)
+        reference_call["function"]["arguments"] = {"city": "SF"}
+        user = {"role": "user", "content": "Weather in SF?"}
+        result = {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"}
+        for fields in (
+            {"reasoning_content": reasoning},
+            {"thinking": reasoning},
+            {"reasoning": reasoning},
+            {"content": [{"type": "thinking", "thinking": reasoning}]},
+            {"content": [{"type": "reasoning", "text": reasoning}]},
             {
-                "id": "call_1",
-                "type": "function",
-                "function": {"name": "get_weather", "arguments": '{"city":"SF"}'},
-            }
-        ]
-        for msg_input in (
-            {
-                "role": "assistant",
-                "reasoning_content": "Need weather tool",
-                "tool_calls": tool_call_payload,
-            },
-            {
-                "role": "assistant",
-                "thinking": "Need weather tool",
-                "tool_calls": tool_call_payload,
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "thinking", "thinking": "Need weather tool"}],
-                "tool_calls": tool_call_payload,
+                "content": [
+                    {"type": "thinking", "thinking": "Need"},
+                    {"type": "reasoning", "text": "weather tool"},
+                ]
             },
         ):
-            with self.subTest(msg_input=msg_input):
+            for preamble in ("", "Checking now."):
+                with self.subTest(fields=fields, preamble=preamble):
+                    assistant = {
+                        "role": "assistant",
+                        "tool_calls": [call],
+                        **copy.deepcopy(fields),
+                    }
+                    if isinstance(assistant.get("content"), list):
+                        assistant["content"].append({"type": "text", "text": preamble})
+                    else:
+                        assistant["content"] = preamble
+                    req = ChatCompletionRequest(
+                        model="openai/gpt-oss-20b",
+                        messages=[user, assistant, result],
+                        tools=[self._GPT_OSS_TOOL],
+                    )
+                    self.chat._process_messages(req, False)
+                    actual = self.tm.tokenizer.encode.call_args.args[0]
+                    thinking = reasoning + (f"\n{preamble}" if preamble else "")
+                    expected = render(
+                        [
+                            user,
+                            {
+                                "role": "assistant",
+                                "content": "",
+                                "thinking": thinking,
+                                "tool_calls": [reference_call],
+                            },
+                            result,
+                        ],
+                        tools=[self._GPT_OSS_TOOL],
+                    )
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(actual.count(reasoning), 1)
+                    self.assertTrue(self.chat.supports_native_reasoning_history())
+
+    def test_gpt_oss_tool_chain_reasoning_lifetime(self):
+        """Retain every unfinished tool round, then let the template drop old analysis."""
+        render = self._use_gpt_oss_history_template()
+        history = [{"role": "user", "content": "Compare SF and NYC weather."}]
+        reference = copy.deepcopy(history)
+        for i, city in enumerate(("SF", "NYC")):
+            call = copy.deepcopy(self._GPT_OSS_CALL)
+            call["id"] = f"call_{i}"
+            call["function"]["arguments"] = json.dumps({"city": city})
+            assistant = {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": f"Look up {city}.",
+                "tool_calls": [call],
+            }
+            result = {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": f"{city}: sunny",
+            }
+            history.extend([assistant, result])
+            expected = copy.deepcopy(assistant)
+            expected["thinking"] = expected.pop("reasoning_content")
+            expected["tool_calls"][0]["function"]["arguments"] = {"city": city}
+            reference.extend([expected, result])
+
+        for completed in (False, True):
+            with self.subTest(completed=completed):
+                tail = (
+                    [
+                        {"role": "assistant", "content": "Both are sunny."},
+                        {"role": "user", "content": "What should I wear?"},
+                    ]
+                    if completed
+                    else []
+                )
                 req = ChatCompletionRequest(
                     model="openai/gpt-oss-20b",
-                    messages=[
-                        {"role": "user", "content": "Weather in SF?"},
-                        msg_input,
-                        {
+                    messages=history + tail,
+                    tools=[self._GPT_OSS_TOOL],
+                )
+                self.chat._process_messages(req, False)
+                actual = self.tm.tokenizer.encode.call_args.args[0]
+                self.assertEqual(
+                    actual, render(reference + tail, tools=[self._GPT_OSS_TOOL])
+                )
+                for city in ("SF", "NYC"):
+                    self.assertEqual(
+                        actual.count(f"Look up {city}."), int(not completed)
+                    )
+                self.assertEqual(actual.count("assistant to=functions.get_weather"), 2)
+
+    def test_anthropic_thinking_history_reaches_gpt_oss_template(self):
+        """#44932: exercise both production adapters, not a fake capability probe."""
+        render = self._use_gpt_oss_history_template()
+        serving = AnthropicServing(self.chat)
+        user = {"role": "user", "content": "Weather in SF?"}
+        reasoning = "Need weather tool."
+        for kind in ("plain", "tool", "preamble"):
+            for stream in (False, True):
+                with self.subTest(kind=kind, stream=stream):
+                    blocks = [
+                        {"type": "thinking", "thinking": reasoning, "signature": ""}
+                    ]
+                    expected = {
+                        "role": "assistant",
+                        "thinking": reasoning,
+                        "content": "",
+                    }
+                    tools = None
+                    if kind == "plain":
+                        blocks.append({"type": "text", "text": "Sunny."})
+                        expected["content"] = "Sunny."
+                        tail = expected_tail = {
+                            "role": "user",
+                            "content": "And tomorrow?",
+                        }
+                    else:
+                        if kind == "preamble":
+                            blocks.append({"type": "text", "text": "Checking now."})
+                            expected["thinking"] += "\nChecking now."
+                        blocks.append(
+                            {
+                                "type": "tool_use",
+                                "id": "call_1",
+                                "name": "get_weather",
+                                "input": {"city": "SF"},
+                            }
+                        )
+                        tail = {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "call_1",
+                                    "content": "Sunny",
+                                }
+                            ],
+                        }
+                        expected_tail = {
                             "role": "tool",
                             "tool_call_id": "call_1",
                             "content": "Sunny",
-                        },
-                    ],
-                )
-                self.chat._apply_jinja_template(req, None, False)
-                rendered = self.tm.tokenizer.encode.call_args.args[0]
-                self.assertIn(
-                    "<|start|>assistant<|channel|>analysis<|message|>Need weather tool<|end|>",
-                    rendered,
-                )
-                self.assertTrue(self.chat.supports_native_reasoning_history())
+                        }
+                        call = copy.deepcopy(self._GPT_OSS_CALL)
+                        call["function"]["arguments"] = {"city": "SF"}
+                        expected["tool_calls"] = [call]
+                        tools = [self._GPT_OSS_TOOL]
+                    request = AnthropicMessagesRequest(
+                        model="openai/gpt-oss-20b",
+                        max_tokens=16,
+                        stream=stream,
+                        messages=[user, {"role": "assistant", "content": blocks}, tail],
+                        tools=[
+                            {
+                                "name": "get_weather",
+                                "description": self._GPT_OSS_TOOL["function"][
+                                    "description"
+                                ],
+                                "input_schema": self._GPT_OSS_TOOL["function"][
+                                    "parameters"
+                                ],
+                            }
+                        ]
+                        if tools
+                        else None,
+                    )
+                    chat_request = serving._convert_to_chat_completion_request(request)
+                    self.chat._process_messages(chat_request, False)
+                    actual = self.tm.tokenizer.encode.call_args.args[0]
+                    self.assertEqual(
+                        actual, render([user, expected, expected_tail], tools=tools)
+                    )
+                    self.assertEqual(actual.count(reasoning), int(kind != "plain"))
+
+    def test_thinking_template_mapping_preserves_visible_tool_preamble(self):
+        """Mapping an alias must neither drop history nor move other models' text."""
+        for access in (
+            "m.thinking",
+            "m['thinking']",
+            "m.get('thinking', '')",
+            "m.reasoning_content",
+        ):
+            for prefix in (
+                "",
+                "{# reasoning_content #}",
+                "{% if false %}{{ m.reasoning_content }}{% endif %}",
+            ):
+                for content_format in ("string", "openai"):
+                    with self.subTest(
+                        access=access, prefix=prefix, content_format=content_format
+                    ):
+                        template = (
+                            "{% for m in messages if m.role == 'assistant' %}"
+                            + prefix
+                            + "{{ "
+                            + access
+                            + " }}|"
+                            "{{ m.content if m.content is string else m.content[0].text }}"
+                            "{% endfor %}"
+                        )
+                        self._use_history_template(template)
+                        self.template_manager.jinja_template_content_format = (
+                            content_format
+                        )
+                        req = ChatCompletionRequest(
+                            model="x",
+                            messages=[
+                                {"role": "user", "content": "hi"},
+                                {
+                                    "role": "assistant",
+                                    "thinking": "analysis",
+                                    "content": [{"type": "text", "text": "visible"}],
+                                    "tool_calls": [self._GPT_OSS_CALL],
+                                },
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": "call_1",
+                                    "content": "Sunny",
+                                },
+                            ],
+                        )
+                        before = req.model_dump()
+                        self.chat._apply_jinja_template(req, None, False)
+                        self.assertEqual(
+                            self.tm.tokenizer.encode.call_args.args[0],
+                            "analysis|visible",
+                        )
+                        self.assertEqual(req.model_dump(), before)
+
+    def test_gpt_oss_mixed_template_keeps_canonical_reasoning_and_content(self):
+        """A custom canonical-aware template must not lose its visible preamble."""
+        self._use_history_template(
+            "{% for m in messages if m.role == 'assistant' %}"
+            "{{ m.reasoning_content if m.reasoning_content is defined else m.thinking }}"
+            "|{{ m.content }}{% endfor %}",
+            gpt_oss=True,
+        )
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "analysis",
+                    "content": "visible",
+                    "tool_calls": [self._GPT_OSS_CALL],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+            ],
+        )
+        self.chat._apply_jinja_template(req, None, False)
+        self.assertEqual(self.tm.tokenizer.encode.call_args.args[0], "analysis|visible")
 
     def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
         self.chat.reasoning_parser = "qwen3"

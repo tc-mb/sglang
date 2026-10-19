@@ -323,6 +323,27 @@ class TestChatCompletionRequest(unittest.TestCase):
                     model="test-model", messages=messages, **request_kwargs
                 )
 
+    def test_assistant_reasoning_alias_precedence_and_serialization(self):
+        """History aliases survive serialization without overriding canonical text."""
+        for fields, expected in (
+            ({"thinking": "thought"}, "thought"),
+            ({"reasoning": "thought"}, "thought"),
+            ({"reasoning_content": None, "thinking": ""}, ""),
+            ({"thinking": "", "reasoning": "fallback"}, ""),
+            ({"thinking": "first", "reasoning": "second"}, "first"),
+            ({"reasoning_content": "", "thinking": "ignored"}, ""),
+            ({"reasoning_content": "canonical", "reasoning": "ignored"}, "canonical"),
+        ):
+            with self.subTest(fields=fields):
+                request = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "assistant", "content": "visible", **fields}],
+                )
+                message = request.messages[0].model_dump()
+                self.assertEqual(message["reasoning_content"], expected)
+                self.assertNotIn("thinking", message)
+                self.assertNotIn("reasoning", message)
+
     def test_chat_completion_accepts_ordered_thinking_parts(self):
         request = ChatCompletionRequest(
             model="test-model",
